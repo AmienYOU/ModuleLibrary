@@ -1,0 +1,296 @@
+TYPE "Scanner_UDT"
+VERSION : 0.1
+   STRUCT
+      Act : Struct
+         Read : Bool;
+         Stop : Bool;
+      END_STRUCT;
+      Paraset : Struct
+         BankNumber : Int;
+      END_STRUCT;
+      Status : Struct
+         Connected : Bool;
+         Busy : Bool;
+         Error : Bool;
+         ReadDone : Bool;
+         StatusID : Word;
+         ReadResult : String[128];
+      END_STRUCT;
+      Feature : Struct
+         Index : Int;
+         "Name" : String[64];
+      END_STRUCT;
+   END_STRUCT;
+
+END_TYPE
+
+FUNCTION_BLOCK "KeyenceScannerModule_New"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      InStartAddr : UInt;   // 组态输入起始地址
+      OutStartAddr : UInt;   // 组态输出起始地址
+   END_VAR
+   VAR_INPUT RETAIN
+      ScanDelay : DInt := 10;   // 扫码延时报错(s)
+   END_VAR
+   VAR_INPUT 
+      HW_ID : HW_DEVICE;   // 扫码枪的硬件ID
+   END_VAR
+
+   VAR_IN_OUT 
+      InsDATA : "Scanner_UDT";
+   END_VAR
+
+   VAR 
+      step : Int;
+      chrResult : Array[0..127] of Char;   // 扫码枪内部的结果字符缓存
+      DelayTon {InstructionName := 'TON_TIME'; LibVersion := '1.0'; S7_SetPoint := 'False'} : TON_TIME;   // 延时定时器
+   END_VAR
+
+   VAR_TEMP 
+      i_temp : Int;
+      PN_Status_temp : Int;
+      PN_STATE_temp : Array[0..31] of Bool;
+   END_VAR
+
+
+BEGIN
+	
+	REGION BLOCK INFO HEADER  功能块信息
+	    //===============================================================================
+	    // YOU YAMING  2024/9  KC.Ltd 
+	    //-------------------------------------------------------------------------------
+	    // Title:            KeyenceScannerModule
+	    //                   基恩士扫码枪PN模块
+	    // Comment/Function: This function is used for keyence code scanner
+	    //                      基恩士扫码枪底层功能块
+	    // Engineering:      TIA Portal V16
+	    // Restrictions:     ENO mechanism is not used, no error handling
+	    // Requirements:     N-L20，SR-1000，SR-X  已适用上述型号
+	    // 
+	    //-------------------------------------------------------------------------------
+	    // Change log table:
+	    // Version  | Date       | Expert in charge       | Changes applied
+	    //----------|------------|------------------------|------------------------------
+	    // 01.00.00   2024.9.20          YYM               First released version
+	    // 
+	END_REGION
+	
+	REGION BLOCK MANUAL 使用说明
+	    //此FB适用于基恩士N-L20和SR系列，使用方法如下：
+	    //1. 在硬件组态中，输入和输出的地址分配需要按顺序偏移，起始地址尽量一致，有多个扫码枪时需要检查地址不要冲突。
+	    //2. 在程序的DB块中定义一个数据类型为Scaner_DATA的变量例如 ‘xxStationxxScanner’，有多少个扫码枪则定义多少。
+	    //3. 实例化本FB，背景数据块怎么分配无所谓，后面不需要使用。
+	    //4. 配置该调用，设置输入输出起始地址，扫码报警时间，将第2步中定义的变量给到IN_OUT数据 ‘InsDATA’，后续编程只需要使用定义的变量 ‘xxStationxxScanner’即可。
+	    //5. 在逻辑程序中使用‘xxStationxxScanner’变量，Act.read置true开始读取，会返回一个Status.readdone脉冲信号，持续2个周期。
+	    //6. 扫码超时会返回Status.error，需要进行Act.stop进行复位
+	END_REGION
+	
+	REGION SCANNER PROFINET IO ADDRESS 基恩士PN地址        
+	    // 参照基恩士官方手册
+	    // 由于SR系列功能较多，且一些高级功能使用频率较低，因此依据N-L20的GSD文件进行配置编程，以完成功能块的标准化
+	    // 
+	    //地址分配实例，从500开始，可更改
+	    //------------输入部分                                                      输出部分
+	    //Handshake AND General Error Status Bits   500           |      Latch and Error Clear Control Bits_1       500
+	    //BUSY Status Bits_1                        501           |      Operation instruction Control Bits_1       501
+	    //Completion Status Bits_1                  502           |      Completion Clear Control Bits_1            502
+	    //Terminal Status Bits_1                    503           |      Parameter Bank Number_1                    503..504
+	    //Operation Result Status_1                 504..523      |  
+	    //Read Data 128Byte_1                       524..629      |  
+	    //
+	    
+	    //除此之外还有需要的地址则此功能块不适用
+	END_REGION
+	
+	REGION STATUSID DESCRIPTION 状态ID定义    
+	    //正常状态
+	    //16#7000   已连接但未进行作业
+	    //16#7001   扫码作业进行中
+	    //16#7002   扫码作业已完成
+	    
+	    //报警状态
+	    //16#80A1   扫码枪断开连接
+	    //16#80A2   扫码枪扫码超时
+	    //16#80A3   扫码枪内部报警
+	END_REGION 
+	
+	///-----------------------以下为程序代码部分-----------------------------
+	//
+	
+	REGION Disconnection Detect掉线检测
+	    
+	    #PN_Status_temp := ModuleStates(LADDR := #HW_ID, MODE := 2, STATE := #PN_STATE_temp);
+	    #InsDATA.Status.Connected := NOT #PN_STATE_temp[0];
+	    
+	    //扫码枪状态ID
+	    //离线状态
+	    IF NOT #InsDATA.Status.Connected THEN
+	        #InsDATA.Status.StatusID := 16#80A1;
+	        #step := 999;
+	    ELSIF #InsDATA.Status.Busy THEN
+	        #InsDATA.Status.StatusID := 16#7001;
+	    ELSIF NOT #InsDATA.Status.Error THEN    //无报错无任务
+	        #InsDATA.Status.StatusID := 16#7000;
+	    END_IF;
+	    
+	END_REGION
+	
+	
+	REGION 状态设置
+	    
+	    //设置扫码枪的错误状态
+	    #InsDATA.Status.Error := (PEEK_BOOL(area := 16#81, dbNumber := 0, byteOffset := #InStartAddr, bitOffset := 0)) OR NOT #InsDATA.Status.Connected OR #step = 999;
+	                                //扫码枪的内部错误标志
+	                                
+	    POKE(area := 16#82,
+	         dbNumber := 0,
+	         byteOffset := #OutStartAddr + 3,
+	         value := INT_TO_WORD (#InsDATA.Paraset.BankNumber) );//设置1-10指定库编号，若设置不在范围内的数值，扫码枪则会依次调用库直至扫码成功
+	    
+	    
+	    //扫码枪报错或者流程长时间扫不上码，复位后流程清零
+	    IF #InsDATA.Act.Stop THEN
+	        #InsDATA.Act.Stop := FALSE;
+	        #step := 0;
+	    END_IF;
+	    
+	END_REGION
+	
+	REGION 读取步骤
+	    CASE #step OF
+	        0://等待读取指令
+	            #DelayTon.IN := FALSE;  //复位定时器
+	            
+	            #InsDATA.Status.Busy := FALSE;     //设置空闲状态
+	            
+	            //清除读取请求状态
+	            POKE_BOOL(area := 16#82,
+	                      dbNumber := 0,
+	                      byteOffset := #OutStartAddr + 1,
+	                      bitOffset := 0,
+	                      value := FALSE);
+	            
+	            IF #InsDATA.Act.Read THEN      //接收扫码请求信号
+	                
+	                #InsDATA.Status.ReadResult := '';  //清楚当前扫码信息
+	                FOR #i_temp := 0 TO 63 DO//清除当前读码信息
+	                    #chrResult[#i_temp] := ' ';
+	                END_FOR;
+	                
+	                #InsDATA.Status.ReadDone := FALSE;     //复位扫码完成信号
+	                
+	                #step := 10;
+	                
+	            END_IF;
+	        10:
+	            
+	            #InsDATA.Status.Busy := TRUE;
+	            
+	            IF PEEK_BOOL(area := 16#81, dbNumber := 0, byteOffset := #InStartAddr + 2, bitOffset := 0) THEN//判断上次扫码结果是否清除
+	                //清除扫码完成信号
+	                POKE_BOOL(area := 16#82,
+	                          dbNumber := 0,
+	                          byteOffset := #OutStartAddr + 2,
+	                          bitOffset := 0,
+	                          value := TRUE);
+	            ELSE
+	                //复位清除扫码完成信号
+	                POKE_BOOL(area := 16#82,
+	                          dbNumber := 0,
+	                          byteOffset := #OutStartAddr + 2,
+	                          bitOffset := 0,
+	                          value := FALSE);
+	                
+	                //写入扫码读取地址，设为true，开始扫码
+	                POKE_BOOL(area := 16#82,
+	                          dbNumber := 0,
+	                          byteOffset := #OutStartAddr + 1,
+	                          bitOffset := 0,
+	                          value := TRUE);
+	            END_IF;
+	            
+	            IF PEEK_BOOL(area := 16#81, dbNumber := 0, byteOffset := #InStartAddr + 1, bitOffset := 0) THEN//判断扫码枪处于busy状态
+	                #step := 20;
+	            END_IF;
+	            
+	        20://等待扫码完成
+	            
+	            //扫码超时计时器
+	            #DelayTon(IN := TRUE,
+	                      PT := DINT_TO_TIME(IN := #ScanDelay * 1000));
+	            
+	            IF #DelayTon.Q THEN
+	                #DelayTon.IN := FALSE;
+	                #InsDATA.Status.StatusID := 16#80A2;
+	                #step := 999;//超时报警流程步
+	            END_IF;
+	            
+	            //等待扫码枪置位完成信号
+	            IF PEEK_BOOL(area := 16#81, dbNumber := 0, byteOffset := #InStartAddr + 2, bitOffset := 0) THEN
+	                
+	                FOR #i_temp := 0 TO 63 DO    //获取扫码枪读取的每个字符
+	                    #chrResult[#i_temp] := PEEK_BYTE(area := 16#81, byteOffset := UINT_TO_DINT(#InStartAddr) + #i_temp + 32, dbNumber := 0);
+	                END_FOR;
+	                #DelayTon.IN := FALSE;
+	                #step := 30;
+	            END_IF;
+	            
+	        30://拼接字符
+	            FOR #i_temp := 127 TO 0 BY -1 DO  //查询最后一个非空字符
+	                IF #chrResult[#i_temp] <> ' ' THEN
+	                    Chars_TO_Strg(Chars := #chrResult,  //拼接
+	                                  pChars := 0,
+	                                  Cnt := 0,
+	                                  Strg => #InsDATA.Status.ReadResult);
+	                    EXIT;
+	                END_IF;
+	            END_FOR;
+	            
+	            //清除读取请求状态
+	            POKE_BOOL(area := 16#82,
+	                      dbNumber := 0,
+	                      byteOffset := #OutStartAddr + 1,
+	                      bitOffset := 0,
+	                      value := FALSE);
+	            #step := 40;
+	            
+	        40://完成读码
+	            IF FIND(IN1 := #InsDATA.Status.ReadResult, IN2 := '$R') > 0 THEN//若返回有回车字符则删除
+	                #InsDATA.Status.ReadResult := DELETE(IN := #InsDATA.Status.ReadResult, L := 2, P := FIND(IN1 := #InsDATA.Status.ReadResult, IN2 := '$R'));
+	            END_IF;
+	            
+	            //判断是否返回的错误提示
+	            IF FIND(IN1 := #InsDATA.Status.ReadResult, IN2 := 'ERROR') > 0 THEN
+	                #InsDATA.Status.ReadResult := '';
+	                #step := 10;//返回重新读取
+	            ELSE
+	                #InsDATA.Status.ReadDone := TRUE;  //读取完成状态设置
+	                #step := 0;
+	            END_IF;
+	            
+	        999://扫码超时错误步       
+	            
+	            //错误状态下不允许读码
+	            //清除读取请求状态
+	            POKE_BOOL(area := 16#82,
+	                      dbNumber := 0,
+	                      byteOffset := #OutStartAddr + 1,
+	                      bitOffset := 0,
+	                      value := FALSE);
+	            
+	            #InsDATA.Status.Busy := FALSE;
+	            
+	    END_CASE;
+	END_REGION
+	
+	//复位请求
+	IF #InsDATA.Act.Read THEN
+	    #InsDATA.Act.Read := FALSE;
+	END_IF;
+	
+	
+	
+END_FUNCTION_BLOCK
+
