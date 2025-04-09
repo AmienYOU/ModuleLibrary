@@ -294,3 +294,17 @@ BEGIN
 	
 END_FUNCTION_BLOCK
 
+
+
+//所有加热板统一温度
+IF NOT "发热板温度单独设置1" THEN
+    FOR #i_temp := 1 TO 14 DO
+        "Com_Recipe".腔体1.加热板温度设置[#i_temp] := "Com_Recipe".腔体1.总温度设置;
+    END_FOR;
+END_IF;
+
+IF NOT "发热板温度单独设置2" THEN
+    FOR #i_temp := 1 TO 14 DO
+        "Com_Recipe".腔体2.加热板温度设置[#i_temp] := "Com_Recipe".腔体2.总温度设置;
+    END_FOR;
+END_IF;
